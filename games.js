@@ -2,24 +2,42 @@ const express = require('express');
 const fetch = require('node-fetch');
 const router = express.Router();
 
-const API_URL = 'https://1xbet.cd/service-api/LiveFeed/GetChampZip';
-const API_PARAMS = new URLSearchParams({
-  sports: 236, champs: 2050671, lng: 'en', gr: 285,
-  country: 96, virtualSports: 'true', groupChamps: 'true',
-});
+// Paramètres corrects extraits du bundle JS officiel 1xbet
+// L'endpoint LiveFeed/GetChampZip attend champId (et NON champs/sports/gr)
+const CHAMP_ID   = process.env.XBET_CHAMP_ID   || '2050671';
+const XBET_LNG   = process.env.XBET_LNG         || 'fr';
 
-const API_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/plain, */*',
-  'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Origin': 'https://1xbet.com',
-  'Referer': 'https://1xbet.com/fr/live/baccarat',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-origin',
-  'Connection': 'keep-alive',
-};
+// Domaines miroir — on essaie chacun jusqu'à obtenir des données
+const API_DOMAINS = (process.env.XBET_DOMAINS || 'https://1xbet.cd,https://1xbet.cm,https://1xbet.ng')
+  .split(',').map(d => d.trim()).filter(Boolean);
+
+function buildApiUrl(domain) {
+  // Noms de paramètres extraits du bundle JS officiel 1xbet :
+  //   kn = G({key:"champId", apiKey:"champ"})   → param API = "champ"
+  //   me = G({key:"lng",     apiKey:"lng"})      → param API = "lng"
+  const p = new URLSearchParams({
+    champ:         CHAMP_ID,   // PAS champId ni champs — le vrai nom est "champ"
+    lng:           XBET_LNG,
+    groupChamps:   'true',
+    virtualSports: 'true',
+    countryOnly:   'false',
+  });
+  return `${domain}/service-api/LiveFeed/GetChampZip?${p}`;
+}
+
+function buildHeaders(domain) {
+  return {
+    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept':          'application/json, text/plain, */*',
+    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Origin':          domain,
+    'Referer':         `${domain}/fr/live/baccarat/${CHAMP_ID}-baccara`,
+    'Sec-Fetch-Dest':  'empty',
+    'Sec-Fetch-Mode':  'cors',
+    'Sec-Fetch-Site':  'same-origin',
+    'Connection':      'keep-alive',
+  };
+}
 
 const SUIT_MAP = { 0: '♠️', 1: '♣️', 2: '♦️', 3: '♥️' };
 let gamesCache     = [];
@@ -115,37 +133,49 @@ function isGameFinished(game, scSList) {
 async function fetchGames() {
   const now = Date.now();
   if (now - lastFetch < CACHE_TTL && gamesCache.length > 0) return gamesCache;
-  try {
-    const resp = await fetch(`${API_URL}?${API_PARAMS}`, { headers: API_HEADERS, timeout: 8000 });
-    if (!resp.ok) {
-      console.error(`Games fetch HTTP error: ${resp.status}`);
-      return gamesCache;
+
+  // Essayer chaque domaine dans l'ordre jusqu'à obtenir des données
+  for (const domain of API_DOMAINS) {
+    try {
+      const url  = buildApiUrl(domain);
+      const resp = await fetch(url, { headers: buildHeaders(domain), timeout: 8000 });
+      if (!resp.ok) {
+        console.warn(`[Games] ${domain} → HTTP ${resp.status}`);
+        continue;
+      }
+      const data   = await resp.json();
+      const parsed = parseRawData(data);
+      if (parsed && parsed.length > 0) {
+        updateCache(parsed, 'server');
+        return gamesCache;
+      }
+      // Value null ou liste vide : aucun jeu en cours sur ce domaine, on log une seule fois
+      if (!parsed) {
+        // Pas de jeux live en ce moment (normal hors des créneaux de diffusion)
+        lastFetch = now; // éviter de re-requêter trop vite
+      }
+    } catch (err) {
+      console.warn(`[Games] ${domain} fetch error: ${err.message}`);
     }
-    const data = await resp.json();
-    const parsed = parseRawData(data);
-    if (parsed) updateCache(parsed, 'server');
-    return gamesCache;
-  } catch (err) {
-    console.error('Games fetch error:', err.message);
-    return gamesCache;
   }
+  return gamesCache;
 }
 
 function parseRawData(data) {
-  if (!data?.Value || !Array.isArray(data.Value)) return null;
-  let baccaratSport = null;
-  for (const sport of data.Value) {
-    if ((sport.N === 'Baccarat' || sport.I === 236) && sport.L) { baccaratSport = sport; break; }
-  }
-  if (!baccaratSport) return null;
-  const results = [];
-  for (const champ of baccaratSport.L || []) {
-    for (const game of champ.G || []) {
+  if (!data?.Value) return null;
+
+  // ── Format 1 : GetChampZip (un seul championnat)
+  //   data.Value = { G: [...], SI: 236, L: "Baccara", LI: 2050671, … }
+  if (!Array.isArray(data.Value) && Array.isArray(data.Value?.G)) {
+    const champ = data.Value;
+    const champName = champ.L || champ.LR || champ.LE || '';
+    const results = [];
+    for (const game of champ.G) {
       if (!game.DI) continue;
       const gn = parseInt(game.DI);
-      if (!Number.isFinite(gn) || gn <= 0) continue; // ignore les DI non-numériques
+      if (!Number.isFinite(gn) || gn <= 0) continue;
       const sc  = game.SC || {};
-      const scS = sc.S  || [];
+      const scS = sc.S   || [];
       const { player, banker } = parseCards(scS);
       results.push({
         game_number:  gn,
@@ -154,13 +184,48 @@ function parseRawData(data) {
         is_finished:  isGameFinished(game, scS),
         phase:        parsePhase(scS),
         score:        sc.FS || {},
-        championship: champ.L || champ.N || '',
+        championship: champName,
         status_label: sc.SLS || '',
       });
     }
+    results.sort((a, b) => b.game_number - a.game_number);
+    return results;
   }
-  results.sort((a, b) => b.game_number - a.game_number);
-  return results;
+
+  // ── Format 2 (legacy) : tableau de sports
+  //   data.Value = [{ N: 'Baccarat', I: 236, L: [{ G: [...] }] }]
+  if (Array.isArray(data.Value)) {
+    let baccaratSport = null;
+    for (const sport of data.Value) {
+      if ((sport.N === 'Baccarat' || sport.I === 236) && sport.L) { baccaratSport = sport; break; }
+    }
+    if (!baccaratSport) return null;
+    const results = [];
+    for (const champ of baccaratSport.L || []) {
+      for (const game of champ.G || []) {
+        if (!game.DI) continue;
+        const gn = parseInt(game.DI);
+        if (!Number.isFinite(gn) || gn <= 0) continue;
+        const sc  = game.SC || {};
+        const scS = sc.S   || [];
+        const { player, banker } = parseCards(scS);
+        results.push({
+          game_number:  gn,
+          player_cards: player, banker_cards: banker,
+          winner:       parseWinner(scS),
+          is_finished:  isGameFinished(game, scS),
+          phase:        parsePhase(scS),
+          score:        sc.FS || {},
+          championship: champ.L || champ.N || '',
+          status_label: sc.SLS || '',
+        });
+      }
+    }
+    results.sort((a, b) => b.game_number - a.game_number);
+    return results;
+  }
+
+  return null;
 }
 
 // POST /api/games/client-push — le navigateur envoie les données brutes de 1xBet
