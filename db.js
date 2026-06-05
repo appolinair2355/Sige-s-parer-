@@ -316,7 +316,6 @@ async function initDB() {
         created_at  TIMESTAMPTZ DEFAULT NOW(),
         updated_at  TIMESTAMPTZ DEFAULT NOW()
       );
-      ALTER TABLE strategy_ideas ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 0;
 
       CREATE TABLE IF NOT EXISTS strategy_idea_purchases (
         id                 SERIAL PRIMARY KEY,
