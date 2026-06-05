@@ -2,7 +2,7 @@ const express = require('express');
 const fetch = require('node-fetch');
 const router = express.Router();
 
-const API_URL = 'https://1xbet.com/service-api/LiveFeed/GetSportsShortZip';
+const API_URL = 'https://1xbet.cd/service-api/LiveFeed/GetChampZip';
 const API_PARAMS = new URLSearchParams({
   sports: 236, champs: 2050671, lng: 'en', gr: 285,
   country: 96, virtualSports: 'true', groupChamps: 'true',
